@@ -21,7 +21,7 @@ const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID || "118179755200-u2
 app.use(express.json());
 app.use(
   cors({
-    origin: ["http://localhost:3000", "http://localhost:3001", "http://localhost:5002", "http://localhost:5001", "https://erode-local.vercel.app"],
+    origin: ["https://erode-local.vercel.app", "https://erode-admin.vercel.app", "http://localhost:5002", "http://localhost:5001"],
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
@@ -201,19 +201,27 @@ const authenticateToken = (req, res, next) => {
   try {
     const authHeader = req.headers["authorization"];
     const token = authHeader && authHeader.split(" ")[1];
+    
     if (!token) {
       return res.status(401).json({ message: "Authentication required. Please login." });
     }
+    
     jwt.verify(token, JWT_SECRET, (err, user) => {
       if (err) {
-        return res.status(403).json({ message: "Invalid or expired token. Please login again." });
+        console.error("JWT verification error:", err.name, err.message);
+        if (err.name === "TokenExpiredError") {
+          return res.status(403).json({ message: "Token expired. Please login again.", expired: true });
+        } else {
+          return res.status(403).json({ message: "Invalid token. Please login again.", invalid: true });
+        }
       }
+      
       req.user = user;
       next();
     });
   } catch (error) {
     console.error("Auth error:", error);
-    res.status(500).json({ message: "Authentication error" });
+    res.status(500).json({ message: "Authentication error", error: error.message });
   }
 };
 
@@ -799,7 +807,17 @@ app.get("/api/wishlist", authenticateToken, async (req, res) => {
     res.status(200).json({ items: sanitizedItems });
   } catch (error) {
     console.error("Error fetching wishlist:", error);
-    res.status(500).json({ message: "Failed to fetch wishlist" });
+    res.status(500).json({ message: "Failed to fetch wishlist", error: error.message });
+  }
+});
+
+// Public wishlist route for non-authenticated users (returns empty list)
+app.get("/api/public/wishlist", async (req, res) => {
+  try {
+    res.status(200).json({ items: [], message: "Guest user - no wishlist available" });
+  } catch (error) {
+    console.error("Error fetching public wishlist:", error);
+    res.status(500).json({ message: "Failed to fetch wishlist", error: error.message });
   }
 });
 
@@ -1114,37 +1132,71 @@ app.get("/api/orders/:orderId", authenticateToken, async (req, res) => {
 
 // Razorpay Integration
 const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID || "rzp_test_59tiIuPnfUGOrp",
-  key_secret: process.env.RAZORPAY_KEY_SECRET || "4u9ny5eo4R7waJNh3DVXshsU",
+  key_id: process.env.RAZORPAY_KEY_ID || "rzp_test_59tiIuPnfUGOrp", // Updated test key
+  key_secret: process.env.RAZORPAY_KEY_SECRET || "4u9ny5eo4R7waJNh3DVXshsU", // Updated test secret
 });
 
 app.post("/api/orders/create", authenticateToken, async (req, res) => {
   try {
-    const { amount } = req.body;
-    const amountInPaise = Math.round(parseFloat(amount) * 100);
-    const order = await razorpay.orders.create({
-      amount: amountInPaise,
-      currency: "INR",
-      receipt: "order_" + Date.now(),
-      notes: {
-        userId: req.user.userId,
-        ...req.body.notes,
-      },
-      payment_capture: 1,
-    });
-    res.status(200).json({
-      success: true,
-      order: {
-        ...order,
-        key: razorpay.key_id,
-      },
-    });
+    const { amount, currency = "INR", notes = {} } = req.body;
+    
+    if (!amount) {
+      return res.status(400).json({
+        success: false,
+        message: "Amount is required",
+      });
+    }
+    
+    // Ensure amount is a valid number
+    const amountInPaise = Math.round(parseFloat(amount));
+    if (isNaN(amountInPaise) || amountInPaise <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid amount. Amount must be a positive number.",
+      });
+    }
+    
+    console.log(`Creating Razorpay order for amount: ${amountInPaise} paise`);
+    
+    // Structured try-catch to get detailed Razorpay errors
+    try {
+      const order = await razorpay.orders.create({
+        amount: amountInPaise,
+        currency: currency || "INR",
+        receipt: "order_" + Date.now(),
+        notes: {
+          userId: req.user.userId,
+          ...notes,
+        },
+        payment_capture: 1,
+      });
+      
+      console.log("Razorpay order created successfully:", order.id);
+      
+      res.status(200).json({
+        success: true,
+        order: {
+          ...order,
+          key: razorpay.key_id,
+        },
+      });
+    } catch (razorpayError) {
+      console.error("Razorpay API error:", razorpayError);
+      
+      // Return a more specific error message
+      res.status(500).json({
+        success: false,
+        message: "Failed to create Razorpay order",
+        error: razorpayError.description || razorpayError.message,
+        errorCode: razorpayError.code || "UNKNOWN_ERROR",
+      });
+    }
   } catch (error) {
     console.error("Razorpay order creation error:", error);
     res.status(500).json({
       success: false,
-      message: error.message || "Failed to create order",
-      error: error.description || error.message,
+      message: "Server error while creating order",
+      error: error.message,
     });
   }
 });
@@ -1599,7 +1651,7 @@ app.get("/api/admin/orders/:orderId/invoice", async (req, res) => {
     res.status(500).json({ 
       success: false, 
       message: "Failed to generate invoice",
-      error: error.message
+      error: error.message,
     });
   }
 });
@@ -1685,6 +1737,47 @@ app.get("/api/public/orders/:orderId/invoice", async (req, res) => {
   }
 });
 
+// Test Razorpay configuration
+app.get("/api/orders/razorpay-test", async (req, res) => {
+  try {
+    // Check if Razorpay is configured
+    if (!razorpay.key_id || !razorpay.key_secret) {
+      return res.status(500).json({
+        success: false,
+        message: "Razorpay is not properly configured",
+        keyAvailable: !!razorpay.key_id,
+        secretAvailable: !!razorpay.key_secret
+      });
+    }
+    
+    // Create a very small test order to verify API connectivity
+    const testOrder = await razorpay.orders.create({
+      amount: 100, // Minimum amount (₹1)
+      currency: "INR",
+      receipt: "test_" + Date.now(),
+      notes: {
+        test: true
+      },
+      payment_capture: 0 // Don't capture payment for test
+    });
+    
+    res.status(200).json({
+      success: true,
+      message: "Razorpay is properly configured",
+      testOrderId: testOrder.id,
+      keyId: razorpay.key_id
+    });
+  } catch (error) {
+    console.error("Razorpay test failed:", error);
+    res.status(500).json({
+      success: false,
+      message: "Razorpay test failed",
+      error: error.message,
+      description: error.description || "No additional details available"
+    });
+  }
+});
+
 // Error Handling Middleware
 app.use((error, req, res, next) => {
   if (error instanceof multer.MulterError) {
@@ -1705,4 +1798,178 @@ app.use((error, req, res, next) => {
 app.listen(PORT, () => {
   console.log(`Server is running on http://localhost:${PORT}`);
   populateCategories();
+});
+
+// Add new discount schema before Error Handling Middleware
+const discountSchema = new mongoose.Schema({
+  code: { type: String, required: true, unique: true, uppercase: true, trim: true },
+  type: { type: String, required: true, enum: ['percentage', 'fixed'], default: 'percentage' },
+  value: { type: Number, required: true, min: 0 },
+  minPurchase: { type: Number, default: 0, min: 0 },
+  maxDiscount: { type: Number, default: null },
+  applicableProducts: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Product' }],
+  applicableCategories: [String],
+  startDate: { type: Date, default: Date.now },
+  endDate: { type: Date },
+  usageLimit: { type: Number, default: null },
+  usageCount: { type: Number, default: 0 },
+  isActive: { type: Boolean, default: true },
+  createdAt: { type: Date, default: Date.now },
+});
+const Discount = mongoose.model("Discount", discountSchema);
+
+// Discount Routes
+app.get("/api/discounts", async (req, res) => {
+  try {
+    const discounts = await Discount.find().sort({ createdAt: -1 });
+    res.status(200).json(discounts);
+  } catch (error) {
+    console.error("Error fetching discounts:", error);
+    res.status(500).json({ message: "Failed to fetch discounts.", error: error.message });
+  }
+});
+
+app.post("/api/discounts", authenticateToken, isAdmin, async (req, res) => {
+  try {
+    const {
+      code,
+      type,
+      value,
+      minPurchase,
+      maxDiscount,
+      applicableProducts,
+      applicableCategories,
+      startDate,
+      endDate,
+      usageLimit,
+      isActive
+    } = req.body;
+
+    if (!code || !type || value === undefined) {
+      return res.status(400).json({ message: "Code, type, and value are required." });
+    }
+
+    const existingDiscount = await Discount.findOne({ code: code.toUpperCase() });
+    if (existingDiscount) {
+      return res.status(400).json({ message: "Discount code already exists." });
+    }
+
+    const discount = new Discount({
+      code: code.toUpperCase(),
+      type,
+      value,
+      minPurchase: minPurchase || 0,
+      maxDiscount: maxDiscount || null,
+      applicableProducts: applicableProducts || [],
+      applicableCategories: applicableCategories || [],
+      startDate: startDate || new Date(),
+      endDate: endDate || null,
+      usageLimit: usageLimit || null,
+      isActive: isActive !== undefined ? isActive : true
+    });
+
+    await discount.save();
+    res.status(201).json({ message: "Discount created successfully", discount });
+  } catch (error) {
+    console.error("Error creating discount:", error);
+    res.status(500).json({ message: "Failed to create discount.", error: error.message });
+  }
+});
+
+app.get("/api/discounts/:id", async (req, res) => {
+  try {
+    const discount = await Discount.findById(req.params.id);
+    if (!discount) {
+      return res.status(404).json({ message: "Discount not found" });
+    }
+    res.status(200).json(discount);
+  } catch (error) {
+    console.error("Error fetching discount:", error);
+    res.status(500).json({ message: "Failed to fetch discount.", error: error.message });
+  }
+});
+
+app.put("/api/discounts/:id", authenticateToken, isAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const discount = await Discount.findByIdAndUpdate(id, req.body, { new: true, runValidators: true });
+    if (!discount) {
+      return res.status(404).json({ message: "Discount not found" });
+    }
+    res.status(200).json({ message: "Discount updated successfully", discount });
+  } catch (error) {
+    console.error("Error updating discount:", error);
+    res.status(500).json({ message: "Failed to update discount.", error: error.message });
+  }
+});
+
+app.delete("/api/discounts/:id", authenticateToken, isAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const discount = await Discount.findByIdAndDelete(id);
+    if (!discount) {
+      return res.status(404).json({ message: "Discount not found" });
+    }
+    res.status(200).json({ message: "Discount deleted successfully" });
+  } catch (error) {
+    console.error("Error deleting discount:", error);
+    res.status(500).json({ message: "Failed to delete discount.", error: error.message });
+  }
+});
+
+// Admin Order Management Routes
+app.put("/api/admin/orders/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, paymentStatus } = req.body;
+    
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid order ID" });
+    }
+    
+    const updateData = {};
+    if (status) updateData.status = status;
+    if (paymentStatus) updateData.paymentStatus = paymentStatus;
+     
+    const order = await Order.findByIdAndUpdate(
+      id,
+      updateData,
+      { new: true, runValidators: true }
+    );
+    
+    if (!order) {
+      return res.status(404).json({ message: "Order not found" });
+    }
+    
+    res.status(200).json({ 
+      message: "Order updated successfully",
+      order
+    });
+  } catch (error) {
+    console.error("Error updating order:", error);
+    res.status(500).json({ message: "Failed to update order", error: error.message });
+  }
+});
+
+app.get("/api/admin/orders/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid order ID" });
+    }
+    
+    const order = await Order.findById(id)
+      .populate("userId", "name email phone")
+      .populate("items.productId");
+      
+    if (!order) {
+      return res.status(404).json({ message: "Order not found" });
+    }
+    
+    res.status(200).json(order);
+  } catch (error) {
+    console.error("Error fetching order:", error);
+    res.status(500).json({ message: "Failed to fetch order", error: error.message });
+  }
 });
